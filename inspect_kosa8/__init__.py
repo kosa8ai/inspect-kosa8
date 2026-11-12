@@ -4,4 +4,4 @@ from inspect_kosa8._sandbox import Kosa8SandboxEnvironment, Kosa8SandboxEnvironm
 
 __all__ = ["Kosa8SandboxEnvironment", "Kosa8SandboxEnvironmentConfig"]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
