@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inspect-kosa8"
-version = "0.1.0"
+version = "0.2.0"
 description = "kosa8 Cloud sandbox environment for Inspect AI"
 readme = "README.md"
 license = { text = "MIT" }

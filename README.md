@@ -6,8 +6,14 @@ Each sample gets its own kosa8 Cloud sandbox, created from a template when the s
 
 ## Install
 
+`inspect-kosa8` is not on PyPI yet. Install it from GitHub until the PyPI release:
+
 ```bash
-pip install inspect-kosa8
+pip install "git+https://github.com/kosa8ai/inspect-kosa8"
+```
+
+```bash
+uv pip install "git+https://github.com/kosa8ai/inspect-kosa8"
 ```
 
 Create an API key in the kosa8 Cloud dashboard and export it:
@@ -102,6 +108,15 @@ deletes what is left. `ttl_s` is a backstop for anything else.
 | `connection()` | No. |
 | Dockerfile / `compose.yaml` configs | No. kosa8 Cloud runs its templates and does not build images, so the provider is not Docker-compatible. |
 
+## kosa8 Cloud basics
+
+- The address is `https://api.kosa8.com` (`KOSA8_CLOUD_URL` overrides it; https only, except localhost).
+- The `base` template is **Alpine Linux**: `sh` is busybox, and there is no `bash`, `python` or `git`. The `python` template adds Python 3. `GET /v1/templates` lists what your org can start.
+- Each command runs in a fresh container; **only `/workspace` persists** between commands (this package also keeps `/tmp`, see below). Install packages into `/workspace`.
+- A buffered exec is cut off after about **30 seconds**; streamed exec, used when the host offers it, is not.
+- Errors from the bundled client (`inspect_kosa8._kosa8`) are typed, all subclasses of `Kosa8Error` with `status` and `code`: `Kosa8PaymentRequiredError` (402; show `upgrade_url`, and an agent should relay `agent_message` and stop), `Kosa8OrgFrozenError` (423 `org_frozen`: an owner or admin must unfreeze the org), `Kosa8RateLimitError` (429, `retry_after`), `Kosa8ExecTimeoutError` (an exec cut off by the 30 s limit; also a `Kosa8TimeoutError`) and `Kosa8NotSupportedError` (501).
+- The bundled client also covers `update_sandbox` (PATCH lifetime), `list_sandboxes`/`iter_sandboxes` (with `limit`/`cursor` paging when the server offers it), and the data-plane calls `read_file`, `write_file`, `list_files`, `create_checkpoint`, `list_checkpoints`, `rewind_sandbox` and `fork_sandbox`. The data-plane calls may answer 501 `not_supported` on current hosts, so this package's own behaviour does not depend on them.
+
 ## How it works, and the limits that follow
 
 The package uses only the kosa8 Cloud calls every host offers today: create, exec, sleep, wake and delete.
@@ -112,7 +127,7 @@ The package uses only the kosa8 Cloud calls every host offers today: create, exe
 - **Long commands.** A buffered exec has to finish within the host's request time, about 30 seconds; past that the command raises `TimeoutError`. When a host offers streamed exec the package uses it and commands run to their `timeout`.
 - **Output.** A buffered exec keeps the first and last 1 MiB of each stream.
 
-Not covered by this package: kosa8's checkpoint, rewind, fork and native file endpoints. They need a host with the kosa8 data plane, which production hosts do not offer yet.
+Not used by this package: kosa8's checkpoint, rewind, fork and native file endpoints. They need a host with the kosa8 data plane, which not every production host offers yet. The bundled client has methods for them if you want to call them yourself.
 
 ## Tests
 
