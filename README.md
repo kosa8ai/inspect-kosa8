@@ -2,7 +2,7 @@
 
 A [kosa8 Cloud](https://kosa8.com) sandbox environment for [Inspect AI](https://inspect.aisi.org.uk/). It registers the `kosa8` sandbox type through Inspect's `inspect_ai` entry point, so once the package is installed, `sandbox="kosa8"` works with no extra import.
 
-Each sample gets its own kosa8 Cloud sandbox, created from a template when the sample starts and deleted when it ends.
+Each sample gets its own kosa8 Cloud sandbox, a microVM created from a template when the sample starts and deleted when it ends.
 
 ## Install
 
@@ -75,6 +75,7 @@ Task(..., sandbox=("kosa8", "kosa8.yaml"))
 | `bash_fallback` | `True` | Run `bash ...` commands with `/bin/sh` when the image has no bash (see below). |
 | `shell` | `"auto"` | Shell that wraps each command: bash when the image has it, else `/bin/sh`. |
 | `stream` | `None` | `None`: streamed exec when the host offers it, else buffered. `False`: buffered only. `True`: require streaming. |
+| `files_api` | `True` | Move files under `/workspace` through the kosa8 files API; `False` sends every file through exec. |
 | `base_url` | `KOSA8_CLOUD_URL` or `https://api.kosa8.com` | API address. |
 
 Concurrency: kosa8 Cloud limits how many sandboxes an org runs at once. The provider's default `max_sandboxes` is 10 (or `KOSA8_MAX_SANDBOXES`); set `--max-sandboxes` to match your org's limit. Creates that find the org at its limit, or no host with room, are retried with backoff up to five times.
@@ -94,25 +95,26 @@ deletes what is left. `ttl_s` is a backstop for anything else.
 
 | `SandboxEnvironment` method | Support |
 |---|---|
-| `exec(cmd, input, cwd, env, timeout)` | Yes. `cmd[0]` is resolved through the image's `PATH`, `env` is passed through the exec API, `input` becomes stdin, `timeout` is enforced inside the sandbox with `timeout -s KILL` and raises `TimeoutError`. Output over Inspect's limit raises `OutputLimitExceededError`. |
-| `exec(user=...)` | No. Commands run as the image's default user; any `user` raises `SandboxUserUnsupportedError`. |
+| `exec(cmd, input, cwd, env, timeout)` | Yes. `cmd[0]` is resolved through the image's `PATH`, `env` is passed through the exec API, `input` becomes stdin, `timeout` is enforced inside the sandbox with `/usr/bin/timeout -s KILL` and by the API's own `timeout_s`, and raises `TimeoutError`. A command that is not executable raises `PermissionError`. Output over Inspect's limit raises `OutputLimitExceededError`. A sandbox that is gone or stopped raises `SandboxUnavailableError`. |
+| `exec(user=...)` | `root` (or `0`) when the image's default user is root, which it is for the kosa8 templates. Commands always run as the image's default user, so any other `user` raises `SandboxUserUnsupportedError`. |
 | `exec(timeout_retry=...)` | Accepted; commands are not retried. |
 | `write_file`, `read_file` | Yes, text and binary, creating parent directories. Raise `FileNotFoundError`, `IsADirectoryError`, `PermissionError`, `UnicodeDecodeError` and `OutputLimitExceededError` as Inspect specifies. Text keeps newlines as written. |
-| `read_file(user=...)`, `write_file(user=...)` | No; raise `SandboxUserUnsupportedError`. |
+| `read_file(user=...)`, `write_file(user=...)` | As for `exec`: `root` when the default user is root, otherwise `SandboxUserUnsupportedError`. |
 | `connection()` | No. |
 | Dockerfile / `compose.yaml` configs | No. kosa8 Cloud runs its templates and does not build images, so the provider is not Docker-compatible. |
 
 ## How it works, and the limits that follow
 
-The package uses only the kosa8 Cloud calls every host offers today: create, exec, sleep, wake and delete.
+The package talks to the kosa8 Cloud REST API with `httpx`: create, exec (buffered and streamed), the files API, sleep, wake and delete.
 
-- **Each command runs in a fresh container** from the template image, over the sandbox's persistent `/workspace` disk. Files under `/workspace` carry from one command to the next; files written elsewhere do not. Commands start in `/workspace`. So that tools which write to `/tmp` keep working, `/tmp` and `/var/tmp` are bind-mounted or linked onto `/workspace/.kosa8-persist/` before each command; add more with `persist_dirs`. System-wide installs (`apk add`, `pip install` into site-packages) do not persist; install into `/workspace` or use a template that has what the eval needs.
-- **Inspect's `bash()` and `python()` tools** call `bash --login -c`. The kosa8 templates are Alpine-based and have no bash, so with `bash_fallback` (the default) such commands run with `/bin/sh` (busybox ash) instead. That covers ordinary shell commands; scripts that rely on bash-only syntax need a template whose image has bash. Inspect's injected sandbox tools keep state under `/var/tmp`, which is why `/var/tmp` is persisted by default; they have not been tested on kosa8 Cloud yet.
-- **Files travel through exec**, base64-encoded in chunks: about 36 KB per upload request (the API accepts 64 KiB of JSON per request) and 512 KiB per download request. The image needs `sh`, `base64` and `dd`, which the kosa8 templates have.
-- **Long commands.** A buffered exec has to finish within the host's request time, about 30 seconds; past that the command raises `TimeoutError`. When a host offers streamed exec the package uses it and commands run to their `timeout`.
-- **Output.** A buffered exec keeps the first and last 1 MiB of each stream.
+- **State between commands.** Commands run in the sandbox's own container, so files written anywhere (`/tmp`, `/root`, `/workspace`) are there for the next command, and survive sleep and wake. Commands start in `/workspace`. For hosts that start each command in a fresh container, `/tmp` and `/var/tmp` are also bind-mounted or linked onto `/workspace/.kosa8-persist/` (`persist_dirs`); on a long-lived container this is a no-op after the first command.
+- **Inspect's `bash()` and `python()` tools** call `bash --login -c`. Templates whose image has no bash (the Alpine-based ones) run such commands with `/bin/sh` instead when `bash_fallback` is on (the default). That covers ordinary shell commands; scripts that rely on bash-only syntax need a template with bash.
+- **Files.** Files under `/workspace` of up to 8 MiB go through the kosa8 files API. Larger files, files elsewhere, hosts without the files API, and every error (so that `FileNotFoundError`, `IsADirectoryError` and `PermissionError` are reported precisely) go through exec, base64-encoded in chunks: about 36 KB per upload request (the API accepts 64 KiB of JSON per request) and 512 KiB per download request. The image needs `sh`, `base64` and `dd`, which the kosa8 templates have.
+- **Long commands.** A buffered exec is held to 90 seconds. When the host offers streamed exec (kosa8 Cloud does), the package streams every command, so commands run to their `timeout` with no limit of their own. A command without a `timeout` on a host that only buffers raises `TimeoutError` at 90 seconds.
+- **Large commands and stdin.** Each exec argument is at most 8 KiB, so the command and its stdin travel in environment variables, and anything over the 64 KiB request is written to `/workspace/.kosa8-run/` first and read from there.
+- **Output.** A buffered exec keeps the first and last 1 MiB of each stream; a streamed one keeps all of it.
 
-Not covered by this package: kosa8's checkpoint, rewind, fork and native file endpoints. They need a host with the kosa8 data plane, which production hosts do not offer yet.
+Not covered by this package: kosa8's snapshot, checkpoint, rewind and fork endpoints, and `connection()`.
 
 ## Tests
 
@@ -121,15 +123,23 @@ uv sync --group test
 uv run pytest
 ```
 
-The tests run against an in-process fake of the kosa8 Cloud API (`tests/fake_cloud.py`) that executes each command for real, including a full `inspect_ai.eval()` with the mock model, so they need no network or key. Optional runs:
+The tests run against an in-process fake of the kosa8 Cloud API (`tests/fake_cloud.py`) that executes each command for real, with the files API on and off. They include Inspect's portable sandbox checks (`inspect_ai.util._sandbox.self_check`) and a full `inspect_ai.eval()` with the mock model, and need no network or key. Lint and types:
+
+```bash
+uv sync --group dev
+uv run ruff check . && uv run ruff format --check . && uv run mypy
+```
+
+Optional runs:
 
 ```bash
 # the transport in a Linux userland like the python template
 kosa8 run -d --name k8test python:3.12-alpine sleep 3600
 KOSA8_TEST_CONTAINER=k8test uv run pytest tests/test_transport.py
 
-# a one-sample eval on kosa8 Cloud itself (creates and deletes one sandbox)
-KOSA8_API_KEY=k8c_live_... uv run pytest tests/test_live.py
+# on kosa8 Cloud itself: Inspect's portable checks and a one-sample eval
+# (each check creates and deletes one sandbox)
+KOSA8_API_KEY=k8c_live_... uv run pytest tests/test_live_self_check.py tests/test_live.py
 ```
 
 ## License
