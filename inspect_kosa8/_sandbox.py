@@ -31,6 +31,7 @@ from inspect_kosa8._kosa8 import (
     SandboxSession,
     adownload,
     adrive,
+    afiles_put,
     aupload,
 )
 
@@ -301,7 +302,9 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
     async def _send(self, op: Op[T]) -> T:
         """Drive an exec operation, turning a gone or stopped sandbox into SandboxUnavailableError."""
         try:
-            return await adrive(op, lambda req: self.client.exec(self.sandbox_id, req))
+            return await adrive(
+                op, lambda req: self.client.exec(self.sandbox_id, req), afiles_put(self.client, self.session, self.sandbox_id)
+            )
         except Kosa8TimeoutError:
             raise
         except Kosa8Error as e:
