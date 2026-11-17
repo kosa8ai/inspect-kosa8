@@ -255,16 +255,17 @@ async def test_files_api_carries_workspace_files(cloud: FakeCloud, config: Kosa8
     calls = _files_calls(cloud)
     if cloud.files_api:
         assert [m for m, _ in calls] == ["POST", "PUT", "GET"]
-        assert cloud.exec_count == execs
+        # One exec installs the write and one checks the read, as the sandbox user.
+        assert cloud.exec_count == execs + 2
     else:
         # One 501 and the client stops asking.
         assert len(calls) == 1
-    # Outside the files API's folder, files always go through exec.
+    # Outside the files API's folder, the bytes are staged in the workspace.
     before = len(_files_calls(cloud))
     other = tmp_path / "elsewhere.txt"
     await env.write_file(str(other), "out")
     assert await env.read_file(str(other)) == "out"
-    assert len(_files_calls(cloud)) == before
+    assert (len(_files_calls(cloud)) > before) == cloud.files_api
 
 
 async def test_buffered_exec_sends_timeout_s(cloud: FakeCloud, config: Kosa8SandboxEnvironmentConfig) -> None:
