@@ -24,6 +24,10 @@ _XFAIL = {
     "test_exec_as_user": "commands run as the image's default user",
     "test_read_file_as_user": "files are read as the image's default user",
     "test_write_file_as_user": "files are written as the image's default user",
+    # The default user in kosa8's templates is root, which file modes do not restrict.
+    "test_read_file_not_allowed": "the default user is root; chmod does not stop root reading",
+    "test_write_text_file_without_permissions": "the default user is root; chmod does not stop root writing",
+    "test_write_binary_file_without_permissions": "the default user is root; chmod does not stop root writing",
 }
 
 
