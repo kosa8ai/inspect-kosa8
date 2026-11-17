@@ -24,7 +24,7 @@ def test_live_eval(tmp_path: Path) -> None:
     from inspect_kosa8 import Kosa8SandboxEnvironmentConfig
 
     @solver
-    def run_in_sandbox():  # noqa: ANN202
+    def run_in_sandbox():
         async def solve(state: TaskState, generate: Generate) -> TaskState:
             await sandbox().write_file("answer.txt", "42")
             r = await sandbox().exec(["python3", "-c", "print(open('answer.txt').read())"])
@@ -34,7 +34,7 @@ def test_live_eval(tmp_path: Path) -> None:
         return solve
 
     @scorer(metrics=[accuracy()])
-    def matches():  # noqa: ANN202
+    def matches():
         async def score(state: TaskState, target: Target) -> Score:
             return Score(value=CORRECT if state.output.completion.strip() == target.text else INCORRECT)
 

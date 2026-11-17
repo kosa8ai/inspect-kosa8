@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "inspect-kosa8"
-version = "0.1.0"
+version = "0.2.0"
 description = "kosa8 Cloud sandbox environment for Inspect AI"
 readme = "README.md"
 license = { text = "MIT" }
@@ -35,6 +35,7 @@ Issues = "https://github.com/kosa8ai/inspect-kosa8/issues"
 
 [dependency-groups]
 test = ["pytest>=8", "pytest-asyncio>=0.23"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6", "mypy>=1.10", "types-PyYAML"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["inspect_kosa8"]
@@ -45,6 +46,22 @@ include = ["inspect_kosa8", "tests", "README.md", "LICENSE"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF100"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/test_self_check.py" = ["F403"]
+"tests/test_live_self_check.py" = ["F403"]
+"tests/*" = ["ASYNC"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = false
+files = ["inspect_kosa8"]

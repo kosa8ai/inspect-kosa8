@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+from collections.abc import Awaitable
 from contextvars import ContextVar
 from logging import getLogger
 from pathlib import Path
-from typing import Literal, Optional, Union, overload
+from typing import Literal, TypeVar, overload
 
 from inspect_ai.util import (
     ExecResult,
@@ -26,22 +27,41 @@ from inspect_kosa8._kosa8 import (
     AsyncKosa8Client,
     Kosa8Error,
     Kosa8TimeoutError,
+    Op,
     SandboxSession,
+    adownload,
     adrive,
+    afiles_put,
+    aupload,
 )
 
 try:  # inspect_ai >= 0.3.2xx
     from inspect_ai.util import SandboxUserUnsupportedError
 except ImportError:  # pragma: no cover - older inspect_ai
+
     class SandboxUserUnsupportedError(RuntimeError):  # type: ignore[no-redef]
         pass
 
+
+try:  # newer inspect_ai
+    from inspect_ai.util import SandboxUnavailableError
+except ImportError:  # pragma: no cover - older inspect_ai
+
+    class SandboxUnavailableError(RuntimeError):  # type: ignore[no-redef]
+        pass
+
+
 logger = getLogger(__name__)
 
+T = TypeVar("T")
 TRACE = "kosa8"
 _BASH_NAMES = ("bash", "/bin/bash", "/usr/bin/bash")
 CREATE_ATTEMPTS = 5
 _RETRYABLE_CREATE = {"no_capacity", "quota_exceeded"}
+# Users a command may ask for when the image's default user is root.
+_ROOT_NAMES = ("root", "0")
+# Answers that mean the sandbox is gone or not running, not that the command failed.
+_UNAVAILABLE = {"not_found", "not_running", "expired", "deleted"}
 
 
 class Kosa8SandboxEnvironmentConfig(BaseModel):
@@ -56,11 +76,11 @@ class Kosa8SandboxEnvironmentConfig(BaseModel):
 
     template: str = "python"
     """kosa8 Cloud template key (``GET /v1/templates``)."""
-    region: Optional[str] = None
+    region: str | None = None
     """Region id such as ``eu-hel1``; the org default when unset."""
-    sleep_after_s: Optional[int] = None
+    sleep_after_s: int | None = None
     """Idle seconds before the sandbox sleeps (0 = never)."""
-    ttl_s: Optional[int] = 4 * 3600
+    ttl_s: int | None = 4 * 3600
     """Seconds until kosa8 Cloud deletes the sandbox even if cleanup never runs."""
     workspace: str = DEFAULT_WORKSPACE
     """Per-sample working directory; relative paths resolve against it."""
@@ -71,10 +91,12 @@ class Kosa8SandboxEnvironmentConfig(BaseModel):
     bash() and python() tools call ``bash --login -c``; Alpine images lack bash)."""
     shell: str = "auto"
     """Shell that runs each command: bash if the image has it, else /bin/sh."""
-    stream: Optional[bool] = None
+    stream: bool | None = None
     """None: streamed exec when the host offers it; False: buffered only; True: require streaming."""
-    base_url: Optional[str] = None
+    base_url: str | None = None
     """API address; defaults to KOSA8_CLOUD_URL or https://api.kosa8.com."""
+    files_api: bool = True
+    """Move files under /workspace through the files API (8 MiB per file); False sends every file through exec."""
 
 
 def _load_config(config: SandboxEnvironmentConfigType | None) -> Kosa8SandboxEnvironmentConfig:
@@ -157,6 +179,8 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
         self.client = client
         self.config = config
         self.session = SandboxSession(workspace=config.workspace, persist_dirs=config.persist_dirs, shell=config.shell)
+        # The default user's uid, read on the first request for user="root".
+        self._default_uid: int | None = None
 
     # Lifecycle ---------------------------------------------------------------
 
@@ -247,7 +271,7 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
         _running.set([])
 
     @classmethod
-    async def cli_cleanup(cls, id: str | None) -> None:  # noqa: A002 (Inspect's name)
+    async def cli_cleanup(cls, id: str | None) -> None:
         ids = [id] if id else _remembered()
         if not ids:
             print("No kosa8 sandboxes recorded by inspect-kosa8 on this machine.")
@@ -259,11 +283,34 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
 
     # Instance methods --------------------------------------------------------
 
-    def _check_user(self, user: str | None) -> None:
-        if user is not None:
-            raise SandboxUserUnsupportedError(
-                f"the kosa8 sandbox runs commands as the image's default user and cannot run as {user!r}"
+    async def _check_user(self, user: str | None) -> None:
+        """Commands run as the image's default user. ``root`` (or ``0``) is
+        accepted when that user is root; any other user raises."""
+        if user is None:
+            return
+        if user in _ROOT_NAMES:
+            if self._default_uid is None:
+                out = await self._send(self.session.command_op("id -u", cwd="/"))
+                try:
+                    self._default_uid = int(out.stdout.strip())
+                except ValueError:
+                    self._default_uid = -1
+            if self._default_uid == 0:
+                return
+        raise SandboxUserUnsupportedError(f"the kosa8 sandbox runs commands as the image's default user and cannot run as {user!r}")
+
+    async def _send(self, op: Op[T]) -> T:
+        """Drive an exec operation, turning a gone or stopped sandbox into SandboxUnavailableError."""
+        try:
+            return await adrive(
+                op, lambda req: self.client.exec(self.sandbox_id, req), afiles_put(self.client, self.session, self.sandbox_id)
             )
+        except Kosa8TimeoutError:
+            raise
+        except Kosa8Error as e:
+            if e.code in _UNAVAILABLE or e.status in (404, 410):
+                raise SandboxUnavailableError(f"kosa8 sandbox {self.sandbox_id} is not available: {e}") from e
+            raise
 
     def _abs(self, file: str) -> str:
         return file if file.startswith("/") else f"{self.config.workspace.rstrip('/')}/{file}"
@@ -271,24 +318,21 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
     async def exec(
         self,
         cmd: list[str],
-        input: str | bytes | None = None,  # noqa: A002 (Inspect's name)
+        input: str | bytes | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         user: str | None = None,
-        timeout: int | None = None,  # noqa: ASYNC109
+        timeout: int | None = None,
         timeout_retry: bool = True,
         concurrency: bool = True,
     ) -> ExecResult[str]:
-        self._check_user(user)
+        await self._check_user(user)
         if not cmd:
             raise ValueError("cmd must not be empty")
         stdin = input.encode("utf-8") if isinstance(input, str) else input
         command = "exec " + shlex.join(cmd)
         if self.config.bash_fallback and cmd[0] in _BASH_NAMES:
-            command = (
-                f"if command -v bash >/dev/null 2>&1; then {command}; "
-                f"else exec {shlex.join(['/bin/sh', *cmd[1:]])}; fi"
-            )
+            command = f"if command -v bash >/dev/null 2>&1; then {command}; else exec {shlex.join(['/bin/sh', *cmd[1:]])}; fi"
         op = self.session.command_op(
             command,
             cwd=cwd,
@@ -297,7 +341,7 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
             stdin=stdin,
         )
         try:
-            out = await adrive(op, lambda req: self.client.exec(self.sandbox_id, req))
+            out = await self._send(op)
         except Kosa8TimeoutError as e:
             raise TimeoutError(f"kosa8 sandbox command timed out: {e}") from e
         if out.timed_out:
@@ -310,13 +354,15 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
                     truncated_output=stream[-limit:],
                 )
         rc = out.exit_code if out.exit_code is not None else 1
+        if rc == 126 and "permission denied" in out.stderr.lower():
+            raise PermissionError(f"Permission denied running {cmd[0]}: {out.stderr.strip()}")
         return ExecResult(success=rc == 0, returncode=rc, stdout=out.stdout, stderr=out.stderr)
 
     async def write_file(self, file: str, contents: str | bytes, *, user: str | None = None) -> None:
-        self._check_user(user)
+        await self._check_user(user)
         path = self._abs(file)
         data = contents.encode("utf-8") if isinstance(contents, str) else contents
-        err = await adrive(self.session.upload_op(path, data), lambda req: self.client.exec(self.sandbox_id, req))
+        err = await self._files(aupload(self.client, self.session, self.sandbox_id, path, data))
         if err is None:
             return
         if err == "is_directory":
@@ -333,12 +379,11 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
     @overload
     async def read_file(self, file: str, text: Literal[False], *, user: str | None = None) -> bytes: ...
 
-    async def read_file(self, file: str, text: bool = True, *, user: str | None = None) -> Union[str, bytes]:
-        self._check_user(user)
+    async def read_file(self, file: str, text: bool = True, *, user: str | None = None) -> str | bytes:
+        await self._check_user(user)
         path = self._abs(file)
-        got = await adrive(
-            self.session.download_op(path, max_bytes=SandboxEnvironmentLimits.MAX_READ_FILE_SIZE),
-            lambda req: self.client.exec(self.sandbox_id, req),
+        got = await self._files(
+            adownload(self.client, self.session, self.sandbox_id, path, max_bytes=SandboxEnvironmentLimits.MAX_READ_FILE_SIZE)
         )
         if got.error is not None:
             if got.error == "file_not_found":
@@ -354,19 +399,27 @@ class Kosa8SandboxEnvironment(SandboxEnvironment):
         # Text keeps newlines as they are (like open(newline="")).
         return data.decode("utf-8") if text else data
 
+    async def _files(self, coro: Awaitable[T]) -> T:
+        try:
+            return await coro
+        except Kosa8TimeoutError as e:
+            raise TimeoutError(f"kosa8 sandbox file transfer timed out: {e}") from e
+        except Kosa8Error as e:
+            if e.code in _UNAVAILABLE or e.status in (404, 410):
+                raise SandboxUnavailableError(f"kosa8 sandbox {self.sandbox_id} is not available: {e}") from e
+            raise
+
 
 def _make_client(cfg: Kosa8SandboxEnvironmentConfig) -> AsyncKosa8Client:
     """The API client for a config (tests replace this)."""
-    return AsyncKosa8Client(base_url=cfg.base_url, stream=cfg.stream)
+    return AsyncKosa8Client(base_url=cfg.base_url, stream=cfg.stream, files_api=None if cfg.files_api else False)
 
 
 async def _create_with_retry(client: AsyncKosa8Client, cfg: Kosa8SandboxEnvironmentConfig) -> dict:  # type: ignore[type-arg]
     delay = 2.0
     for attempt in range(1, CREATE_ATTEMPTS + 1):
         try:
-            return await client.create_sandbox(
-                template=cfg.template, region=cfg.region, sleep_after_s=cfg.sleep_after_s, ttl_s=cfg.ttl_s
-            )
+            return await client.create_sandbox(template=cfg.template, region=cfg.region, sleep_after_s=cfg.sleep_after_s, ttl_s=cfg.ttl_s)
         except Kosa8Error as e:
             if e.code not in _RETRYABLE_CREATE or attempt == CREATE_ATTEMPTS:
                 raise
